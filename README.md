@@ -141,6 +141,32 @@ never see a partly written package.
 
 ## Running unattended
 
+`bin/bioc-tmux` runs `start` or `run` in a detached tmux session, so the
+cycle keeps going after you log out, and also appends the output to
+`$BIOC_BUILD_ROOT/tmux-logs/<session>-<time>.log`:
+
+```bash
+ssh -t supermicro
+cd ~/r-container-binaries-local-builder
+bin/bioc-tmux start ghcr.io/bioconductor/bioconductor_docker:devel
+# detach with Ctrl-b d; reattach later with:
+tmux attach -t bioc-bioconductor-docker-devel
+```
+
+- The session is named after the image (`start`) or the cycle directory
+  (`run`); use `--session NAME` to choose another. If that session already
+  exists, nothing is started.
+- `--detach` starts the session without attaching to it.
+- Settings such as `MAX_JOBS` or `BUILD_MEMORY_LIMIT` are taken from your
+  current shell, even if a tmux server is already running.
+- When `bioc-build` finishes, the window shows its exit status and waits for
+  Enter before closing.
+- After a reboot, resume with `bin/bioc-tmux run ~/bioc-builds/<cycle>`.
+
+Alternatively, run it as a transient systemd user service, with its output
+in the journal. Transient units don't survive a reboot either, so resume
+with `run` after one:
+
 ```bash
 systemd-run --user --unit=bioc-build-devel \
   -E BIOC_BUILD_ROOT=/data/bioc-builds \
@@ -155,6 +181,7 @@ with `loginctl enable-linger`.
 
 ```
 bin/bioc-build             # the driver (all commands)
+bin/bioc-tmux              # runs start/run in a detached tmux session
 lib/find_ready_pkgs.py     # picks packages whose deps are built (unchanged from k8s-builder)
 lib/cycle_status.py        # progress and completion check
 pod/deps_json.R            # dependency graph (unchanged from k8s-builder)
