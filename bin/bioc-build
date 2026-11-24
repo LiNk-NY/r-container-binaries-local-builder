@@ -392,7 +392,8 @@ cmd_stop() {
 cmd_index() {
   load_cycle "${1:-}"
   log "Writing the PACKAGES index"
-  run_in_image bash /mnt/.scripts/index.sh || die "Indexing failed"
+  run_in_image bash /mnt/.scripts/index.sh > "${LOGS}/index.log" 2>&1 ||
+    die "Indexing failed; see ${LOGS}/index.log"
   cp "${DATA_DIR}/tarballs/PACKAGES" "${CYCLE_DIR}/PACKAGES"
   grep -c '^Package:' "${CYCLE_DIR}/PACKAGES" > "${CYCLE_DIR}/indexed_packages_count" || true
   date '+%Y-%m-%d %H:%M:%S %Z' > "${CYCLE_DIR}/cycle_complete_time"

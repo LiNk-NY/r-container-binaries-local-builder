@@ -44,12 +44,16 @@ bin/bioc-build start ghcr.io/bioconductor/bioconductor_docker:RELEASE_3_22
 then runs the build loop until every package has been built, has failed, or
 is blocked by a failed dependency. It then writes the `PACKAGES` index.
 
-The results are in `$BIOC_BUILD_ROOT/<cycle>/data/tarballs/`, which can be
-used directly as a CRAN-style repository, for example:
+The results are in `$BIOC_BUILD_ROOT/<cycle>/data/tarballs/`. That folder
+is the `src/contrib` level of a repository, so give it to R as a
+`contriburl`, inside a container from the same image:
 
 ```r
-install.packages("S4Vectors", repos = "file:///data/bioc-builds/<cycle>/data/tarballs")
+install.packages("S4Vectors", contriburl = "file:///data/bioc-builds/<cycle>/data/tarballs")
 ```
+
+To serve it as a full repository (`repos = ...`), copy or link it to
+`<repo>/src/contrib/`.
 
 ## Commands
 
@@ -110,6 +114,7 @@ by stopping the cycle and running it again.
 │       ├── attempt-<n>.log    # logs of earlier failed attempts
 │       └── attempts
 ├── PACKAGES  indexed_packages_count  cycle_complete_time   # after index
+│   (logs/index.log has the indexing output)
 └── data/                     # mounted at /mnt in every container
     ├── .scripts/             # copy of pod/ taken when the cycle started
     ├── library/              # shared library of built packages
