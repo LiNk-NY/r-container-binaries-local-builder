@@ -84,7 +84,7 @@ bioc-build list
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `BIOC_BUILD_ROOT` | `~/bioc-builds` | Where cycle directories are created |
-| `MAX_JOBS` | min(CPUs, RAM GiB / 4) | Concurrent builds |
+| `MAX_JOBS` | min(2/3 of CPUs, RAM GiB / 4) | Concurrent builds |
 | `BUILD_TIMEOUT_SECONDS` | 3600 | A build running longer is killed (BBS `INSTALL` timeout) |
 | `BUILD_ATTEMPTS` | 2 | Attempts per package before it is marked failed |
 | `BUILD_MEMORY_LIMIT` | none | `docker run --memory` for each build, e.g. `8g` |
