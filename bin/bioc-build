@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+# bioc-build - Build Bioconductor binary packages on one machine with Docker.
+#
+# A cycle builds every Bioconductor software package in dependency order
+# inside one container image, then indexes the resulting binaries. All state
+# lives in a cycle directory; see README.md.
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+# Tunables (environment).
+DOCKER="${DOCKER:-docker}"
+BUILD_ROOT="${BIOC_BUILD_ROOT:-${HOME}/bioc-builds}"
+POLL_SECONDS="${POLL_SECONDS:-30}"
+# Default matches the Bioconductor Build System INSTALL timeout for bioc
+# software builds (BBSvars.py: 3600 s).
+BUILD_TIMEOUT_SECONDS="${BUILD_TIMEOUT_SECONDS:-3600}"
+# Total attempts per package; failed builds are retried until this is reached.
+BUILD_ATTEMPTS="${BUILD_ATTEMPTS:-2}"
+BUILD_MEMORY_LIMIT="${BUILD_MEMORY_LIMIT:-}"   # e.g. 8g; empty = no limit
+BUILD_CPU_LIMIT="${BUILD_CPU_LIMIT:-}"         # e.g. 2; empty = no limit
+
+usage() {
+  cat <<'EOF'
+Usage: bioc-build <command> [options]
+
+Commands:
+  start [--only PKG,...] [--no-pull] [--no-run] IMAGE
+                         Create a cycle for IMAGE, compute the dependency
+                         graph, then run it (unless --no-run).
+  run CYCLE_DIR          Run or resume a cycle until it finishes, then index.
+  status CYCLE_DIR       Show progress and running builds.
+  stop CYCLE_DIR         Stop the driver and remove running build containers.
+                         `run` resumes later and rebuilds what was stopped.
+  index CYCLE_DIR        Write the PACKAGES index for the built binaries.
+  clean [--all] CYCLE_DIR
+                         Delete the shared library and staging files.
+                         --all deletes the whole cycle directory.
+  list                   List cycles under $BIOC_BUILD_ROOT.
+
+Environment:
+  BIOC_BUILD_ROOT        Where cycles are created (default ~/bioc-builds)
+  MAX_JOBS               Concurrent builds (default: min(CPUs, RAM GiB / 4))
+  BUILD_TIMEOUT_SECONDS  Per-build time limit (default 3600)
+  BUILD_ATTEMPTS         Attempts per package (default 2)
+  BUILD_MEMORY_LIMIT     docker --memory per build (default: none)
+  BUILD_CPU_LIMIT        docker --cpus per build (default: none)
+  POLL_SECONDS           Driver poll interval (default 30)
+  DOCKER                 Container CLI (default docker)
+EOF
+}
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# DOCKER may hold a command with arguments (e.g. "sudo docker").
+# shellcheck disable=SC2086
+dk() { ${DOCKER} "$@"; }
+
+sanitize_name() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr '._' '--' | tr -cd '[:alnum:]-'
+}
+
+default_max_jobs() {
+  local cpus mem_gib by_mem
+  cpus="$(nproc)"
+  mem_gib="$(awk '/^MemTotal:/ { print int($2 / 1048576) }' /proc/meminfo)"
+  by_mem=$(( mem_gib / 4 ))
+  local n=$(( cpus < by_mem ? cpus : by_mem ))
+  echo $(( n > 0 ? n : 1 ))
+}
+MAX_JOBS="${MAX_JOBS:-$(default_max_jobs)}"
+
+# Append a line to a file unless it is already there.
+add_line() { grep -qxF -- "$1" "$2" 2>/dev/null || printf '%s\n' "$1" >> "$2"; }
+
+# Read lines including a last line without a trailing newline.
+read_lines() { awk 'NF' "$@" 2>/dev/null || true; }
+
+load_cycle() {
+  [[ -n "${1:-}" ]] || die "CYCLE_DIR is required"
+  [[ -f "$1/cycle.env" ]] || die "Not a cycle directory: $1"
+  CYCLE_DIR="$(cd "$1" && pwd)"
+  DATA_DIR="${CYCLE_DIR}/data"
+  LOGS="${CYCLE_DIR}/logs"
+  # shellcheck source=/dev/null
+  source "${CYCLE_DIR}/cycle.env"
+}
+
+# Run a one-off command in the cycle's image with the data directory mounted.
+run_in_image() {
+  dk run --rm --label "bioc.cycle=${CYCLE_ID}" --label bioc.role=helper \
+    -v "${DATA_DIR}:/mnt" "${IMAGE_ID}" "$@"
+}
+
+build_containers() {
+  dk ps -aq --filter "label=bioc.cycle=${CYCLE_ID}" --filter label=bioc.role=build
+}
+
+count_running() { build_containers | grep -c . || true; }
+
+# ---------------------------------------------------------------------------
+# Build dispatch and bookkeeping
+
+dispatch() {
+  local pkg="$1"
+  if ! [[ "${pkg}" =~ ^[A-Za-z][A-Za-z0-9.]*$ ]]; then
+    log "Skipping invalid package name: ${pkg}"
+    add_line "${pkg}" "${LOGS}/dispatched-packages.txt"
+    add_line "${pkg}" "${LOGS}/failed-packages.txt"
+    return 0
+  fi
+  local args=(run -d --name "bioc-${CYCLE_ID}-${pkg}"
+    --label "bioc.cycle=${CYCLE_ID}" --label bioc.role=build
+    --label "bioc.pkg=${pkg}" -e "PKG=${pkg}" -v "${DATA_DIR}:/mnt")
+  [[ -z "${BUILD_MEMORY_LIMIT}" ]] || args+=(--memory "${BUILD_MEMORY_LIMIT}")
+  [[ -z "${BUILD_CPU_LIMIT}" ]] || args+=(--cpus "${BUILD_CPU_LIMIT}")
+  args+=("${IMAGE_ID}" bash /mnt/.scripts/build_pkg.sh)
+  # Record the dispatch only once the container exists, so a failed start is
+  # simply retried on the next poll.
+  if dk "${args[@]}" >/dev/null; then
+    add_line "${pkg}" "${LOGS}/dispatched-packages.txt"
+    log "Started ${pkg}"
+  else
+    log "Could not start a container for ${pkg}; will retry"
+  fi
+}
+
+# Judge one exited build container, record the result, and remove it.
+finish_build() {
+  local id="$1" pkg="$2" code="$3" oom="$4"
+  local dir="${LOGS}/${pkg}"
+
+  if grep -qxF -- "${pkg}" "${LOGS}/successful-packages.txt" "${LOGS}/failed-packages.txt" 2>/dev/null; then
+    dk rm -f "${id}" >/dev/null
+    return 0
+  fi
+
+  mkdir -p "${dir}"
+  local tmp="${dir}/current.log"
+  dk logs "${id}" > "${tmp}" 2>&1 || true
+  dk rm -f "${id}" >/dev/null
+
+  # Success needs a zero exit and evidence that this package's binary
+  # tarball was produced.
+  local re="${pkg//./\\.}"
+  local reason=""
+  if [[ "${code}" != 0 ]]; then
+    if [[ "${oom}" == true ]]; then
+      reason="out of memory (exit ${code})"
+    elif [[ "${code}" == 137 ]]; then
+      reason="killed: exceeded ${BUILD_TIMEOUT_SECONDS}s or stopped (exit 137)"
+    else
+      reason="exit code ${code}"
+    fi
+  elif ! { grep -qE "/${re}_[^[:space:]]+\.tar\.gz" "${tmp}" &&
+           grep -qE "packaged installation of.*${re}_.*\.tar\.gz" "${tmp}"; }; then
+    reason="no binary tarball produced"
+  fi
+
+  if [[ -z "${reason}" ]]; then
+    mv "${tmp}" "${dir}/build-success.log"
+    add_line "${pkg}" "${LOGS}/successful-packages.txt"
+    log "Built ${pkg}"
+    return 0
+  fi
+
+  local attempts
+  attempts=$(( $(cat "${dir}/attempts" 2>/dev/null || echo 0) + 1 ))
+  echo "${attempts}" > "${dir}/attempts"
+  if (( attempts < BUILD_ATTEMPTS )); then
+    mv "${tmp}" "${dir}/attempt-${attempts}.log"
+    log "Failed ${pkg} (${reason}); retrying (attempt $((attempts + 1)) of ${BUILD_ATTEMPTS})"
+    dispatch "${pkg}"
+  else
+    { echo "Build failed: ${reason} (attempt ${attempts} of ${BUILD_ATTEMPTS})"
+      cat "${tmp}"; } > "${dir}/build-fail.log"
+    rm -f "${tmp}"
+    add_line "${pkg}" "${LOGS}/failed-packages.txt"
+    log "Failed ${pkg} (${reason})"
+  fi
+}
+
+# Kill builds past their time limit and record finished ones.
+handle_builds() {
+  local ids now
+  ids="$(build_containers)"
+  [[ -n "${ids}" ]] || return 0
+  now="$(date +%s)"
+  # shellcheck disable=SC2086
+  dk inspect -f '{{.Id}}|{{index .Config.Labels "bioc.pkg"}}|{{.State.Status}}|{{.State.ExitCode}}|{{.State.StartedAt}}|{{.State.OOMKilled}}' ${ids} |
+  while IFS='|' read -r id pkg status code started oom; do
+    case "${status}" in
+      running)
+        local start_s
+        start_s="$(date -d "${started}" +%s 2>/dev/null || echo "${now}")"
+        if (( now - start_s > BUILD_TIMEOUT_SECONDS )); then
+          log "Killing ${pkg}: running longer than ${BUILD_TIMEOUT_SECONDS}s"
+          dk kill "${id}" >/dev/null 2>&1 || true
+        fi
+        ;;
+      exited|dead)
+        finish_build "${id}" "${pkg}" "${code}" "${oom}"
+        ;;
+    esac
+  done
+}
+
+# A package recorded as dispatched, with no result and no container (e.g.
+# after `stop` or a reboot), is put back in the queue.
+requeue_orphans() {
+  local orphans
+  orphans="$(comm -23 \
+    <(read_lines "${LOGS}/dispatched-packages.txt" | sort -u) \
+    <({ read_lines "${LOGS}/successful-packages.txt" "${LOGS}/failed-packages.txt"
+        dk ps -a --filter "label=bioc.cycle=${CYCLE_ID}" --filter label=bioc.role=build \
+          --format '{{.Label "bioc.pkg"}}'; } | sort -u))"
+  [[ -n "${orphans}" ]] || return 0
+  log "Requeueing $(grep -c . <<<"${orphans}") interrupted build(s)"
+  read_lines "${LOGS}/dispatched-packages.txt" | grep -vxF -f <(echo "${orphans}") \
+    > "${LOGS}/dispatched-packages.txt.new" || true
+  mv "${LOGS}/dispatched-packages.txt.new" "${LOGS}/dispatched-packages.txt"
+}
+
+find_ready() {
+  python3 "${REPO_DIR}/lib/find_ready_pkgs.py" \
+    "${CYCLE_DIR}/biocdeps.json" \
+    "${CYCLE_DIR}/ready_packages.txt" \
+    "${LOGS}/dispatched-packages.txt" \
+    "${LOGS}/successful-packages.txt" \
+    "${CYCLE_DIR}/remaining-packages.json" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+
+cmd_start() {
+  local only="" pull=1 run=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --only) only="${2:?--only needs a value}"; shift 2 ;;
+      --no-pull) pull=0; shift ;;
+      --no-run) run=0; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *) break ;;
+    esac
+  done
+  local image="${1:?IMAGE is required}"
+
+  if (( pull )); then
+    log "Pulling ${image}"
+    dk pull "${image}" >/dev/null || die "Could not pull ${image} (use --no-pull for a local image)"
+  fi
+  IMAGE_ID="$(dk image inspect -f '{{.Id}}' "${image}")" || die "Image not found: ${image}"
+
+  # e.g. ghcr.io/bioconductor/bioconductor_docker:RELEASE_3_22
+  local base="${image##*/}" name tag
+  name="${base%%[:@]*}"
+  tag="latest"
+  [[ "${base}" == *:* ]] && tag="${base#*:}"
+  [[ "${base}" == *@* ]] && tag="digest"
+  CYCLE_ID="$(date '+%Y%m%d-%H%M%S')-$(sanitize_name "${name}" | cut -c1-24)-$(sanitize_name "${tag}" | cut -c1-20)"
+  CYCLE_ID="${CYCLE_ID%-}"
+
+  CYCLE_DIR="${BUILD_ROOT}/${CYCLE_ID}"
+  DATA_DIR="${CYCLE_DIR}/data"
+  LOGS="${CYCLE_DIR}/logs"
+  [[ ! -e "${CYCLE_DIR}" ]] || die "Already exists: ${CYCLE_DIR}"
+  mkdir -p "${DATA_DIR}/.scripts" "${LOGS}"
+  cp "${REPO_DIR}"/pod/* "${DATA_DIR}/.scripts/"
+  printf 'CYCLE_ID=%q\nIMAGE=%q\nIMAGE_ID=%q\n' "${CYCLE_ID}" "${image}" "${IMAGE_ID}" \
+    > "${CYCLE_DIR}/cycle.env"
+  touch "${LOGS}"/{dispatched,successful,failed}-packages.txt
+
+  log "Created cycle ${CYCLE_DIR}"
+  log "Computing the dependency graph"
+  run_in_image Rscript /mnt/.scripts/deps_json.R \
+    --biocdeps=/mnt/biocdeps.json --uniquedeps=/mnt/uniquedeps.json \
+    || die "Dependency graph step failed"
+  local f
+  for f in biocdeps.json uniquedeps.json bioc_version r_version container_name; do
+    cp "${DATA_DIR}/${f}" "${CYCLE_DIR}/${f}"
+  done
+
+  if [[ -n "${only}" ]]; then
+    cp "${CYCLE_DIR}/biocdeps.json" "${CYCLE_DIR}/biocdeps.full.json"
+    python3 - "${CYCLE_DIR}/biocdeps.json" "${only}" <<'EOF'
+import json, sys
+path, wanted = sys.argv[1], [p for p in sys.argv[2].split(",") if p]
+with open(path) as f:
+    deps = json.load(f)
+unknown = [p for p in wanted if p not in deps]
+if unknown:
+    sys.exit("Not Bioconductor software packages: " + ", ".join(unknown))
+keep = set(wanted)
+for p in wanted:
+    keep.update(deps[p])
+with open(path, "w") as f:
+    json.dump({p: deps[p] for p in sorted(keep)}, f, indent=2)
+print(f"Limited the cycle to {len(keep)} packages "
+      f"({len(wanted)} requested plus their Bioconductor dependencies)")
+EOF
+  fi
+
+  log "Bioconductor $(cat "${CYCLE_DIR}/bioc_version"), R $(cat "${CYCLE_DIR}/r_version")"
+  if (( run )); then
+    cmd_run "${CYCLE_DIR}"
+  else
+    log "Run it with: $0 run ${CYCLE_DIR}"
+  fi
+}
+
+cmd_run() {
+  load_cycle "${1:-}"
+  exec 9>"${CYCLE_DIR}/.lock"
+  flock -n 9 || die "Another bioc-build is already running this cycle"
+  rm -f "${CYCLE_DIR}/STOP"
+  log "Running ${CYCLE_ID} with up to ${MAX_JOBS} concurrent builds"
+
+  local running slots last=""
+  while :; do
+    if [[ -f "${CYCLE_DIR}/STOP" ]]; then
+      log "Stop requested; exiting"
+      return 0
+    fi
+    handle_builds
+    requeue_orphans
+    find_ready
+
+    running="$(count_running)"
+    slots=$(( MAX_JOBS - running ))
+    if (( slots > 0 )); then
+      while IFS= read -r pkg; do
+        dispatch "${pkg}"
+      done < <(read_lines "${CYCLE_DIR}/ready_packages.txt" | head -n "${slots}")
+      running="$(count_running)"
+      find_ready   # so the ready count excludes what was just started
+    fi
+
+    local progress
+    if progress="$(python3 "${REPO_DIR}/lib/cycle_status.py" --brief "${CYCLE_DIR}" "${running}")"; then
+      log "${progress}"
+      log "All buildable packages are done"
+      cmd_index "${CYCLE_DIR}"
+      return 0
+    fi
+    if [[ "${progress}" != "${last}" ]]; then
+      log "${progress}"
+      last="${progress}"
+    fi
+    sleep "${POLL_SECONDS}"
+  done
+}
+
+cmd_status() {
+  load_cycle "${1:-}"
+  echo "Cycle:  ${CYCLE_ID}"
+  # shellcheck disable=SC2153  # IMAGE comes from cycle.env
+  echo "Image:  ${IMAGE}"
+  echo "Driver: $(flock -n "${CYCLE_DIR}/.lock" true 2>/dev/null && echo "not running" || echo running)"
+  [[ ! -f "${CYCLE_DIR}/cycle_complete_time" ]] ||
+    echo "Indexed: $(cat "${CYCLE_DIR}/cycle_complete_time"), $(cat "${CYCLE_DIR}/indexed_packages_count") packages"
+  echo
+  python3 "${REPO_DIR}/lib/cycle_status.py" "${CYCLE_DIR}" "$(count_running)" || true
+  local ids
+  ids="$(build_containers)"
+  if [[ -n "${ids}" ]]; then
+    echo
+    echo "Running builds:"
+    dk ps -a --filter "label=bioc.cycle=${CYCLE_ID}" --filter label=bioc.role=build \
+      --format '  {{.Label "bioc.pkg"}}\t{{.Status}}'
+  fi
+}
+
+cmd_stop() {
+  load_cycle "${1:-}"
+  touch "${CYCLE_DIR}/STOP"
+  exec 9>"${CYCLE_DIR}/.lock"
+  log "Waiting for the driver to exit"
+  flock -w $(( POLL_SECONDS * 4 + 60 )) 9 || die "The driver did not exit; is it stuck?"
+  local ids
+  ids="$(build_containers)"
+  if [[ -n "${ids}" ]]; then
+    log "Removing $(grep -c . <<<"${ids}") build container(s)"
+    # shellcheck disable=SC2086
+    dk rm -f ${ids} >/dev/null
+  fi
+  log "Stopped. Resume with: $0 run ${CYCLE_DIR}"
+}
+
+cmd_index() {
+  load_cycle "${1:-}"
+  log "Writing the PACKAGES index"
+  run_in_image bash /mnt/.scripts/index.sh || die "Indexing failed"
+  cp "${DATA_DIR}/tarballs/PACKAGES" "${CYCLE_DIR}/PACKAGES"
+  grep -c '^Package:' "${CYCLE_DIR}/PACKAGES" > "${CYCLE_DIR}/indexed_packages_count" || true
+  date '+%Y-%m-%d %H:%M:%S %Z' > "${CYCLE_DIR}/cycle_complete_time"
+  log "Indexed $(cat "${CYCLE_DIR}/indexed_packages_count") packages in ${DATA_DIR}/tarballs"
+}
+
+cmd_clean() {
+  local all=0
+  [[ "${1:-}" == --all ]] && { all=1; shift; }
+  load_cycle "${1:-}"
+  exec 9>"${CYCLE_DIR}/.lock"
+  flock -n 9 || die "The driver is running; run stop first"
+  local ids
+  ids="$(build_containers)"
+  # shellcheck disable=SC2086
+  [[ -z "${ids}" ]] || dk rm -f ${ids} >/dev/null
+  # Builds run as root in the container, so delete their files from there.
+  if (( all )); then
+    run_in_image find /mnt -mindepth 1 -delete
+    rm -rf "${CYCLE_DIR}"
+    log "Deleted ${CYCLE_DIR}"
+  else
+    run_in_image rm -rf /mnt/library /mnt/.staging
+    log "Deleted the shared library and staging files; tarballs and logs are kept"
+  fi
+}
+
+cmd_list() {
+  local d
+  for d in "${BUILD_ROOT}"/*/; do
+    [[ -f "${d}cycle.env" ]] || continue
+    local state="in progress"
+    [[ -f "${d}cycle_complete_time" ]] && state="indexed $(cat "${d}cycle_complete_time")"
+    printf '%s\t%s\n' "${d%/}" "${state}"
+  done
+}
+
+main() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "${cmd}" in
+    start)  cmd_start "$@" ;;
+    run)    cmd_run "$@" ;;
+    status) cmd_status "$@" ;;
+    stop)   cmd_stop "$@" ;;
+    index)  cmd_index "$@" ;;
+    clean)  cmd_clean "$@" ;;
+    list)   cmd_list ;;
+    -h|--help|help|"") usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"
