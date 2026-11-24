@@ -87,7 +87,7 @@ bioc-build list
 | `MAX_JOBS` | min(2/3 of CPUs, RAM GiB / 4) | Concurrent builds |
 | `BUILD_TIMEOUT_SECONDS` | 3600 | A build running longer is killed (BBS `INSTALL` timeout) |
 | `BUILD_ATTEMPTS` | 2 | Attempts per package before it is marked failed |
-| `BUILD_MEMORY_LIMIT` | none | `docker run --memory` for each build, e.g. `8g` |
+| `BUILD_MEMORY_LIMIT` | `16g` | `docker run --memory` for each build; a build that exceeds it is recorded as out of memory. Set to an empty string for no limit |
 | `BUILD_CPU_LIMIT` | none | `docker run --cpus` for each build |
 | `POLL_SECONDS` | 30 | How often the driver checks builds |
 | `DOCKER` | `docker` | Container CLI command |
