@@ -20,7 +20,8 @@ BUILD_ROOT="${BIOC_BUILD_ROOT:-${HOME}/bioc-builds}"
 # running does not see this shell's environment, so they are written into
 # the runner script instead.
 PASS_VARS=(BIOC_BUILD_ROOT MAX_JOBS BUILD_TIMEOUT_SECONDS BUILD_ATTEMPTS
-  BUILD_MEMORY_LIMIT BUILD_CPU_LIMIT POLL_SECONDS DOCKER)
+  BUILD_MEMORY_LIMIT BUILD_CPU_LIMIT BUILD_NICE BUILD_CPU_SHARES POLL_SECONDS
+  DOCKER)
 
 usage() {
   sed -n '2,/^$/{s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"

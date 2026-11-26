@@ -89,8 +89,20 @@ bioc-build list
 | `BUILD_ATTEMPTS` | 2 | Attempts per package before it is marked failed |
 | `BUILD_MEMORY_LIMIT` | `16g` | `docker run --memory` for each build; a build that exceeds it is recorded as out of memory. Set to an empty string for no limit |
 | `BUILD_CPU_LIMIT` | none | `docker run --cpus` for each build |
+| `BUILD_NICE` | none | Run each build under `nice -n` (e.g. `19`) |
+| `BUILD_CPU_SHARES` | none | `docker run --cpu-shares` for each build; `2` gives the lowest CPU weight |
 | `POLL_SECONDS` | 30 | How often the driver checks builds |
 | `DOCKER` | `docker` | Container CLI command |
+
+To run builds at low priority, set both `BUILD_NICE=19` and
+`BUILD_CPU_SHARES=2`. Under cgroup v2 every container is its own cgroup, and
+niceness only orders processes within a cgroup; against other users'
+processes, the kernel goes by the container's CPU weight, which
+`--cpu-shares` sets. Containers sit under `system.slice`, which has the same
+weight as `user.slice` by default, so when other users keep the machine busy
+the builds can still get up to half of the CPU time. Lowering that further
+needs root (for example, a low `CPUWeight` on a slice passed with
+`--cgroup-parent`).
 
 `MAX_JOBS` and the limits are read when `run` starts, so you can change them
 by stopping the cycle and running it again.

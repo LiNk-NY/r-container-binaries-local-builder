@@ -23,6 +23,12 @@ BUILD_ATTEMPTS="${BUILD_ATTEMPTS:-2}"
 # machine. Set to an empty string for no limit.
 BUILD_MEMORY_LIMIT="${BUILD_MEMORY_LIMIT-16g}"
 BUILD_CPU_LIMIT="${BUILD_CPU_LIMIT:-}"         # e.g. 2; empty = no limit
+# Low priority for builds. BUILD_NICE runs the build under `nice -n`, which
+# orders processes inside the container. Under cgroup v2 each container is
+# its own cgroup, so the CPU weight set by BUILD_CPU_SHARES (2 = cpu.weight
+# 1, the lowest) is what orders builds against other users' processes.
+BUILD_NICE="${BUILD_NICE:-}"                   # e.g. 19; empty = no change
+BUILD_CPU_SHARES="${BUILD_CPU_SHARES:-}"       # e.g. 2; empty = default
 
 usage() {
   cat <<'EOF'
@@ -49,6 +55,8 @@ Environment:
   BUILD_ATTEMPTS         Attempts per package (default 2)
   BUILD_MEMORY_LIMIT     docker --memory per build (default 16g; empty = none)
   BUILD_CPU_LIMIT        docker --cpus per build (default: none)
+  BUILD_NICE             Run each build under nice -n (default: none)
+  BUILD_CPU_SHARES       docker --cpu-shares per build (default: none)
   POLL_SECONDS           Driver poll interval (default 30)
   DOCKER                 Container CLI (default docker)
 EOF
@@ -123,7 +131,10 @@ dispatch() {
   [[ -z "${BUILD_MEMORY_LIMIT}" ]] ||
     args+=(--memory "${BUILD_MEMORY_LIMIT}" --memory-swap "${BUILD_MEMORY_LIMIT}")
   [[ -z "${BUILD_CPU_LIMIT}" ]] || args+=(--cpus "${BUILD_CPU_LIMIT}")
-  args+=("${IMAGE_ID}" bash /mnt/.scripts/build_pkg.sh)
+  [[ -z "${BUILD_CPU_SHARES}" ]] || args+=(--cpu-shares "${BUILD_CPU_SHARES}")
+  args+=("${IMAGE_ID}")
+  [[ -z "${BUILD_NICE}" ]] || args+=(nice -n "${BUILD_NICE}")
+  args+=(bash /mnt/.scripts/build_pkg.sh)
   # Record the dispatch only once the container exists, so a failed start is
   # simply retried on the next poll.
   if dk "${args[@]}" >/dev/null; then
