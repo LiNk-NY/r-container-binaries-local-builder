@@ -22,6 +22,15 @@ BUILD_ATTEMPTS="${BUILD_ATTEMPTS:-2}"
 # assumes, so heavy builds still fit, but a runaway build cannot take the
 # machine. Set to an empty string for no limit.
 BUILD_MEMORY_LIMIT="${BUILD_MEMORY_LIMIT-16g}"
+# Cores each build may use: dependencies install in parallel (Ncpus) and
+# make runs with -j. Each build is capped at this many CPUs unless
+# BUILD_CPU_LIMIT is set (an empty BUILD_CPU_LIMIT means no cap).
+BUILD_NCPUS="${BUILD_NCPUS:-1}"
+[[ "${BUILD_NCPUS}" =~ ^[1-9][0-9]*$ ]] ||
+  { echo "BUILD_NCPUS must be a positive integer" >&2; exit 1; }
+if [[ -z "${BUILD_CPU_LIMIT+set}" ]] && (( BUILD_NCPUS > 1 )); then
+  BUILD_CPU_LIMIT="${BUILD_NCPUS}"
+fi
 BUILD_CPU_LIMIT="${BUILD_CPU_LIMIT:-}"         # e.g. 2; empty = no limit
 # Low priority for builds. BUILD_NICE runs the build under `nice -n`, which
 # orders processes inside the container. Under cgroup v2 each container is
@@ -54,7 +63,9 @@ Environment:
   BUILD_TIMEOUT_SECONDS  Per-build time limit (default 3600)
   BUILD_ATTEMPTS         Attempts per package (default 2)
   BUILD_MEMORY_LIMIT     docker --memory per build (default 16g; empty = none)
-  BUILD_CPU_LIMIT        docker --cpus per build (default: none)
+  BUILD_NCPUS            Cores per build: Ncpus and make -j (default 1)
+  BUILD_CPU_LIMIT        docker --cpus per build (default: BUILD_NCPUS if
+                         above 1, else none; empty = none)
   BUILD_NICE             Run each build under nice -n (default: none)
   BUILD_CPU_SHARES       docker --cpu-shares per build (default: none)
   POLL_SECONDS           Driver poll interval (default 30)
@@ -126,7 +137,8 @@ dispatch() {
   fi
   local args=(run -d --name "bioc-${CYCLE_ID}-${pkg}"
     --label "bioc.cycle=${CYCLE_ID}" --label bioc.role=build
-    --label "bioc.pkg=${pkg}" -e "PKG=${pkg}" -v "${DATA_DIR}:/mnt")
+    --label "bioc.pkg=${pkg}" -e "PKG=${pkg}"
+    -e "BUILD_NCPUS=${BUILD_NCPUS}" -v "${DATA_DIR}:/mnt")
   # Equal --memory-swap makes the cap strict (no extra swap on top).
   [[ -z "${BUILD_MEMORY_LIMIT}" ]] ||
     args+=(--memory "${BUILD_MEMORY_LIMIT}" --memory-swap "${BUILD_MEMORY_LIMIT}")
@@ -334,7 +346,8 @@ cmd_run() {
   exec 9>"${CYCLE_DIR}/.lock"
   flock -n 9 || die "Another bioc-build is already running this cycle"
   rm -f "${CYCLE_DIR}/STOP"
-  log "Running ${CYCLE_ID} with up to ${MAX_JOBS} concurrent builds"
+  log "Running ${CYCLE_ID} with up to ${MAX_JOBS} concurrent builds," \
+    "${BUILD_NCPUS} core(s) each (CPU limit: ${BUILD_CPU_LIMIT:-none})"
 
   local running slots last=""
   while :; do

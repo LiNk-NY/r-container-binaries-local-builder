@@ -10,7 +10,8 @@
 # /mnt/.staging and renamed into place, so concurrent builds never see a
 # partially written package or tarball.
 #
-# Input: the PKG environment variable.
+# Input: the PKG environment variable, and optionally BUILD_NCPUS (cores
+# for parallel dependency installs and make -j; default 1).
 
 set -euxo pipefail
 shopt -s nullglob
@@ -26,6 +27,10 @@ STAGEDIR="/mnt/.staging"
 # Unique per container; names staging paths on the shared volume.
 STAGE_TAG="$(hostname)"
 WORKDIR="/tmp/build"
+export BUILD_NCPUS="${BUILD_NCPUS:-1}"
+if [ "${BUILD_NCPUS}" -gt 1 ] && [ -z "${MAKEFLAGS:-}" ]; then
+  export MAKEFLAGS="-j${BUILD_NCPUS}"
+fi
 
 mkdir -p "${TARDIR}" "${TEMP_LIBRARY}" "${SHARED_LIBRARY}" "${STAGEDIR}" "${WORKDIR}"
 
@@ -65,6 +70,7 @@ time Rscript -e '
   pkg <- Sys.getenv("PKG")
   tmp <- Sys.getenv("TEMP_LIBRARY")
   .libPaths(c(tmp, Sys.getenv("SHARED_LIBRARY"), .libPaths()))
+  options(Ncpus = as.integer(Sys.getenv("BUILD_NCPUS", "1")))
   BiocManager::install(
     pkg, INSTALL_opts = "--build", update = TRUE, quiet = FALSE,
     dependencies = TRUE, force = TRUE, keep_outputs = TRUE
