@@ -162,9 +162,15 @@ cycle keeps going after you log out, and also appends the output to
 ssh -t supermicro
 cd ~/r-container-binaries-local-builder
 bin/bioc-tmux start ghcr.io/bioconductor/bioconductor_docker:devel
-# detach with Ctrl-b d; reattach later with:
+# detach with the tmux prefix then d (Ctrl-b d by default); reattach with:
 tmux attach -t bioc-bioconductor-docker-devel
 ```
+
+To detach, press the tmux prefix key followed by `d`. The prefix is
+`Ctrl-b` unless your `~/.tmux.conf` changes it (`set -g prefix C-a` makes it
+`Ctrl-a`). You can also press the prefix and `:` to open the tmux command
+prompt, then type `detach`. Don't type `detach` in the pane itself: it shows
+`bioc-build` output, not a shell.
 
 - The session is named after the image (`start`) or the cycle directory
   (`run`); use `--session NAME` to choose another. If that session already
@@ -175,6 +181,62 @@ tmux attach -t bioc-bioconductor-docker-devel
 - When `bioc-build` finishes, the window shows its exit status and waits for
   Enter before closing.
 - After a reboot, resume with `bin/bioc-tmux run ~/bioc-builds/<cycle>`.
+
+### Example: a full cycle on a shared 96-core server
+
+These are the settings used for a RELEASE_3_24 cycle on a shared server
+with 96 CPUs and 1 TB of RAM. Adjust the numbers to your machine.
+
+```bash
+ssh -t supermicro
+cd ~/r-container-binaries-local-builder
+export BIOC_BUILD_ROOT=~/bioc-builds MAX_JOBS=48 BUILD_NCPUS=4 \
+       BUILD_MEMORY_LIMIT=32g BUILD_NICE=19 BUILD_CPU_SHARES=2
+bin/bioc-tmux --session bioc-3-24 start \
+    ghcr.io/bioconductor/bioconductor_docker:RELEASE_3_24
+# detach (prefix d, or prefix : then "detach"), then log out
+```
+
+Why these values:
+
+- `MAX_JOBS=48` with `BUILD_NCPUS=4`: each build is capped at 4 CPUs, so
+  at most 192 CPUs' worth of work is requested on 96 cores. Early in a cycle
+  few packages are ready, and each build compiles many of its own
+  dependencies, so it uses all 4. Later many packages are ready but most
+  builds compile one package, so the slots keep the machine busy. In a
+  smoke test, the BiocGenerics build (which compiles most of its Suggests)
+  took 13 minutes with 8 cores against 38 minutes with 1.
+- `BUILD_MEMORY_LIMIT=32g`: parallel installs and `make -j` in one build use
+  more memory than a serial build; 16g risks killing heavy C++ builds.
+- `BUILD_NICE=19` and `BUILD_CPU_SHARES=2`: other users' work comes first,
+  so oversubscribing the CPUs only slows the builds down (see Settings).
+- `--session` gives the session a short fixed name. Add `--no-pull` if the
+  image is already pulled and you want to use it as is.
+
+Check progress from any login, without attaching:
+
+```bash
+cd ~/r-container-binaries-local-builder
+export BIOC_BUILD_ROOT=~/bioc-builds
+bin/bioc-build list                          # cycle directories and state
+bin/bioc-build status ~/bioc-builds/<cycle>  # built, failed, running, blocked
+tail -f ~/bioc-builds/tmux-logs/bioc-3-24-*.log
+tmux attach -t bioc-3-24                     # watch live
+```
+
+To change settings partway through, stop the cycle, close the old tmux
+session (press Enter in it, or `tmux kill-session -t bioc-3-24`), change the
+exports, and resume. Packages already built are kept, and interrupted builds
+start again:
+
+```bash
+bin/bioc-build stop ~/bioc-builds/<cycle>
+export MAX_JOBS=32                           # for example
+bin/bioc-tmux --session bioc-3-24 run ~/bioc-builds/<cycle>
+```
+
+The binaries and the `PACKAGES` index end up in
+`~/bioc-builds/<cycle>/data/tarballs/`.
 
 Alternatively, run it as a transient systemd user service, with its output
 in the journal. Transient units don't survive a reboot either, so resume

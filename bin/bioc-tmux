@@ -98,7 +98,7 @@ tmux new-session -d -s "${session}" -c "${REPO_DIR}" "bash $(printf '%q' "${runn
 
 echo "Started tmux session '${session}'"
 echo "  Log:    ${log}"
-echo "  Attach: tmux attach -t ${session}   (detach again with Ctrl-b d)"
+echo "  Attach: tmux attach -t ${session}   (detach: tmux prefix, then d)"
 
 if (( detach )) || [[ ! -t 1 ]]; then
   exit 0
