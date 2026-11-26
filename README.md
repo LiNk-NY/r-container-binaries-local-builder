@@ -88,7 +88,7 @@ bioc-build list
 | `BUILD_TIMEOUT_SECONDS` | 3600 | A build running longer is killed (BBS `INSTALL` timeout) |
 | `BUILD_ATTEMPTS` | 2 | Attempts per package before it is marked failed |
 | `BUILD_MEMORY_LIMIT` | `16g` | `docker run --memory` for each build; a build that exceeds it is recorded as out of memory. Set to an empty string for no limit |
-| `BUILD_NCPUS` | 1 | Cores per build: dependencies install in parallel (`Ncpus`) and `make` runs with `-j` |
+| `BUILD_NCPUS` | 1 | Cores per build: dependencies install in parallel (`Ncpus`) and `make` runs with `-j`. If a package fails, its last attempt runs serially, since some packages' Makefiles break under `-j` |
 | `BUILD_CPU_LIMIT` | `BUILD_NCPUS` if above 1, else none | `docker run --cpus` for each build; set to an empty string for no cap |
 | `BUILD_NICE` | none | Run each build under `nice -n` (e.g. `19`) |
 | `BUILD_CPU_SHARES` | none | `docker run --cpu-shares` for each build; `2` gives the lowest CPU weight |
