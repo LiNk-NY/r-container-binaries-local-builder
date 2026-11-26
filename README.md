@@ -159,7 +159,7 @@ cycle keeps going after you log out, and also appends the output to
 `$BIOC_BUILD_ROOT/tmux-logs/<session>-<time>.log`:
 
 ```bash
-ssh -t supermicro
+ssh supermicro
 cd ~/r-container-binaries-local-builder
 bin/bioc-tmux start ghcr.io/bioconductor/bioconductor_docker:devel
 # detach with the tmux prefix then d (Ctrl-b d by default); reattach with:
@@ -182,13 +182,26 @@ prompt, then type `detach`. Don't type `detach` in the pane itself: it shows
   Enter before closing.
 - After a reboot, resume with `bin/bioc-tmux run ~/bioc-builds/<cycle>`.
 
+To reattach straight from your own machine, give ssh the command and `-t`:
+
+```bash
+ssh -t supermicro tmux attach -t <session>
+```
+
+ssh allocates a terminal for an interactive login, but not when it is given a
+command to run. tmux needs a terminal (without one it fails with
+`open terminal failed: not a terminal`), so `-t` asks for one. Commands that
+only print output, such as
+`ssh supermicro r-container-binaries-local-builder/bin/bioc-build list`,
+don't need it.
+
 ### Example: a full cycle on a shared 96-core server
 
 These are the settings used for a RELEASE_3_24 cycle on a shared server
 with 96 CPUs and 1 TB of RAM. Adjust the numbers to your machine.
 
 ```bash
-ssh -t supermicro
+ssh supermicro
 cd ~/r-container-binaries-local-builder
 export BIOC_BUILD_ROOT=~/bioc-builds MAX_JOBS=48 BUILD_NCPUS=4 \
        BUILD_MEMORY_LIMIT=32g BUILD_NICE=19 BUILD_CPU_SHARES=2
